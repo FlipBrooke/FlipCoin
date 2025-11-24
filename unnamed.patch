@@ -1,0 +1,692 @@
+Index: main.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/main.py b/main.py
+--- a/main.py
++++ b/main.py	(date 1763960787266)
+@@ -1,4 +1,4 @@
+-# main.py — cleaned, fixed, ready-to-run
++# main.py — ready-to-run (welcome + conditional bank bonus + transaction slip)
+ import asyncio
+ import discord
+ from dotenv import load_dotenv
+@@ -13,7 +13,7 @@
+ 
+ bot = discord.Bot(intents=discord.Intents.default())
+ 
+-# embed color used everywhere
++# embed color used everywhere (fallback)
+ EMBED_COLOR_YELLOW = 0xFFD43B
+ 
+ 
+@@ -26,10 +26,6 @@
+ 
+ 
+ def clean(num):
+-    """
+-    Short formatter for balances shown in parentheses next to usernames:
+-    1_234 -> '1.2k', 1_234_567 -> '1.2m', etc.
+-    """
+     try:
+         n = float(num)
+     except Exception:
+@@ -55,7 +51,7 @@
+ # ---------------- DB helpers ----------------
+ def get_user_row(discord_id: str):
+     try:
+-        resp = supabase.table("users").select("discord_id, username, balance, pfp").eq("discord_id", discord_id).execute()
++        resp = supabase.table("users").select("*").eq("discord_id", discord_id).execute()
+         if getattr(resp, "data", None) and len(resp.data) > 0:
+             return resp.data[0]
+         return None
+@@ -64,20 +60,28 @@
+         return None
+ 
+ 
+-def upsert_user_basic(discord_id: str, username: str, pfp_url: str):
++def upsert_user_basic(discord_id: str, username: str, pfp_url: str, color_hex: str):
++    """
++    Returns True if a new user was inserted, False if an existing user was updated or on error.
++    """
+     try:
+         existing = supabase.table("users").select("discord_id").eq("discord_id", discord_id).execute()
+         if getattr(existing, "data", None) and len(existing.data) > 0:
+-            supabase.table("users").update({"username": username, "pfp": pfp_url}).eq("discord_id", discord_id).execute()
++            supabase.table("users").update({"username": username, "pfp": pfp_url, "color": color_hex}).eq("discord_id", discord_id).execute()
++            return False
+         else:
++            # Ensure a balance field exists (default 0)
+             supabase.table("users").insert({
+                 "discord_id": discord_id,
+                 "username": username,
+                 "pfp": pfp_url,
++                "color": color_hex,
+                 "balance": 0
+             }).execute()
++            return True
+     except Exception as e:
+         print("upsert_user_basic error:", e)
++        return False
+ 
+ 
+ def log_transaction(from_id: str, to_id: str, amount: int, from_bal: int, to_bal: int, reason: str):
+@@ -97,10 +101,6 @@
+ 
+ # ---------------- atomic RPC + fallback transfer ----------------
+ def rpc_atomic_send(sender_id: str, recipient_id: str, amount: int, reason: str):
+-    """
+-    Call the Postgres RPC atomic_send. On success returns (from_bal, to_bal).
+-    Raises Exception on error.
+-    """
+     try:
+         resp = supabase.rpc('atomic_send', {
+             'sender_id': sender_id,
+@@ -121,14 +121,10 @@
+         to_bal = row.get("to_bal")
+         return int(from_bal), int(to_bal)
+     except Exception as e:
+-        # bubble up the exception for caller to decide fallback vs re-raise
+         raise
+ 
+ 
+ def fallback_transfer(sender_id: str, recipient_id: str, amount: int, reason: str):
+-    """
+-    Conditional update fallback. Returns (from_bal, to_bal) or raises Exception.
+-    """
+     try:
+         s = supabase.table("users").select("balance").eq("discord_id", sender_id).execute()
+         if not getattr(s, "data", None) or len(s.data) == 0:
+@@ -150,7 +146,6 @@
+         new_recipient_bal = recipient_bal + amount
+         supabase.table("users").update({"balance": new_recipient_bal}).eq("discord_id", recipient_id).execute()
+ 
+-        # log as fallback path
+         log_transaction(sender_id, recipient_id, amount, new_sender_bal, new_recipient_bal, reason)
+         return new_sender_bal, new_recipient_bal
+     except Exception:
+@@ -158,33 +153,56 @@
+ 
+ 
+ def transfer_money(sender_id: str, recipient_id: str, amount: int, reason: str):
+-    """
+-    Try RPC atomic_send first; if not available attempt fallback_transfer.
+-    Returns (from_bal, to_bal) or raises Exception.
+-    """
+     try:
+         return rpc_atomic_send(sender_id, recipient_id, amount, reason)
+     except Exception as e:
+         msg = str(e).lower()
+-        # if RPC clearly signaled insufficient funds or missing user, surface it
+         if "insufficient" in msg or "sender_not_found" in msg or "recipient_not_found" in msg:
+             raise
+-        # otherwise attempt fallback
+         try:
+             return fallback_transfer(sender_id, recipient_id, amount, reason)
+         except Exception:
+-            # if fallback also fails, re-raise original RPC exception
+             raise
+ 
+ 
+ async def async_transfer(sender_id: str, recipient_id: str, amount: int, reason: str):
+-    """
+-    Async wrapper around transfer_money (sync). Always await this when performing a transfer.
+-    """
+     loop = asyncio.get_running_loop()
+     return await loop.run_in_executor(None, transfer_money, sender_id, recipient_id, amount, reason)
+ 
+ 
++# ---------------- color helper ----------------
++def parse_color_hex_to_int(color_hex: str):
++    """
++    Accepts '#RRGGBB' or 'RRGGBB' and returns an int usable by discord.Color.
++    Returns the fallback EMBED_COLOR_YELLOW on parse failure or missing value.
++    """
++    if not color_hex:
++        return EMBED_COLOR_YELLOW
++    try:
++        s = color_hex.strip()
++        if s.startswith("#"):
++            s = s[1:]
++        if len(s) != 6:
++            return EMBED_COLOR_YELLOW
++        return int(s, 16)
++    except Exception:
++        return EMBED_COLOR_YELLOW
++
++
++def get_embed_color_for_id(discord_id: str):
++    """
++    Always prefer the user's stored `color` field. If missing or invalid,
++    fall back to EMBED_COLOR_YELLOW.
++    """
++    if not discord_id:
++        return EMBED_COLOR_YELLOW
++    row = get_user_row(discord_id)
++    if not row:
++        return EMBED_COLOR_YELLOW
++    color_hex = row.get("color")
++    return parse_color_hex_to_int(color_hex)
++
++
+ # ---------------- safe interaction helpers ----------------
+ async def safe_defer(ctx, ephemeral: bool = False) -> bool:
+     try:
+@@ -192,15 +210,11 @@
+             await ctx.defer(ephemeral=ephemeral)
+             return True
+     except Exception as e:
+-        # common when interaction already responded/expired
+         print("safe_defer:", e)
+     return False
+ 
+ 
+ async def safe_respond(ctx, *args, ephemeral=False, **kwargs):
+-    """
+-    Send a reply safely: if already deferred/responded, use followup; else respond.
+-    """
+     try:
+         if hasattr(ctx, "response"):
+             if ctx.response.is_done():
+@@ -208,7 +222,6 @@
+             else:
+                 await ctx.respond(*args, ephemeral=ephemeral, **kwargs)
+         else:
+-            # fallback for raw Interaction-like objects
+             await ctx.send(*args, **kwargs)
+     except Exception:
+         try:
+@@ -231,72 +244,134 @@
+ # ---------------- commands ----------------
+ @bot.slash_command(name="register", description="Create or update your account")
+ async def register(ctx):
+-    try:
+-        discord_id = str(ctx.author.id)
+-        avatar_url = str(ctx.author.display_avatar.url)
+-        username = ctx.author.name
++    used_followup = await safe_defer(ctx)
++    discord_id = str(ctx.author.id)
++    avatar_url = str(ctx.author.display_avatar.url)
++    username = ctx.author.name
+ 
+-        # Use top role color as default if user has one; fallback to #FFD43B
+-        role_color_int = ctx.author.color.value if ctx.author.color.value != 0 else 0xFFD43B
+-        color_hex = f"#{role_color_int:06x}"
++    # prefer user's role color as initial stored color if they don't have one yet
++    role_color_int = ctx.author.color.value if ctx.author.color.value != 0 else EMBED_COLOR_YELLOW
++    color_hex = f"#{role_color_int:06x}"
+ 
+-        # Now compute and store pfp + palette color only if changed
+-        pfp_url, _ = await compute_and_store_pfp_color_if_changed(discord_id, avatar_url)
++    # detect whether this is a new user or an update
++    was_new = upsert_user_basic(discord_id, username, avatar_url, color_hex)
++
++    # after upsert, get the canonical row and stored color
++    row = get_user_row(discord_id)
++    balance_amount = row.get("balance", 0) if row else 0
++    pfp = row.get("pfp") if row else None
+ 
+-        # Upsert username and color in DB
+-        existing = supabase.table("users").select("*").eq("discord_id", discord_id).execute()
+-        if getattr(existing, "data", None) and len(existing.data) > 0:
+-            supabase.table("users").update({
+-                "username": username,
+-                "pfp": pfp_url,
+-                "color": color_hex
+-            }).eq("discord_id", discord_id).execute()
+-            await ctx.respond("Account updated with latest username, profile picture, and role color!")
+-        else:
+-            supabase.table("users").insert({
+-                "discord_id": discord_id,
+-                "username": username,
+-                "pfp": pfp_url,
+-                "color": color_hex,
+-            }).execute()
+-            await ctx.respond("Account created with your role color!")
+-    except Exception as e:
+-        print("register error:", e)
+-        await ctx.respond(f"Error: {str(e)}", ephemeral=True)
++    # Use stored color field for embed color (falls back to constant)
++    color_int = get_embed_color_for_id(discord_id)
++
++    # Send either welcome (new) or updated message (existing)
++    if was_new:
++        welcome_embed = discord.Embed(
++            title=f"Welcome, {username}!",
++            color=discord.Color(color_int),
++            description="Your account has been created. 🎉"
++        )
++    else:
++        welcome_embed = discord.Embed(
++            title=f"Account updated — {username}",
++            color=discord.Color(color_int),
++            description="Your account information has been updated."
++        )
++    if pfp:
++        welcome_embed.set_thumbnail(url=pfp)
++
++    await safe_respond(ctx, embed=welcome_embed)
++
++    # If this was a NEW registration, try to give up to 50 coins from the bank
++    if was_new:
++        bank_id = None
++        if bot.user:
++            bank_id = str(bot.user.id)
++
++        # if no bank account exists in DB, treat as balance 0
++        bank_balance = 0
++        if bank_id:
++            bank_row = get_user_row(bank_id)
++            bank_balance = int(bank_row.get("balance", 0)) if bank_row else 0
++
++        # If the bank has at least 50, attempt transfer
++        if bank_balance >= 50 and bank_id:
++            try:
++                from_bal, to_bal = await async_transfer(bank_id, discord_id, 50, "${username}'s beta-tester bonus")
++                # refresh user row for accurate display
++                row = get_user_row(discord_id)
++                balance_amount = row.get("balance", balance_amount) if row else balance_amount
++
++                # Transaction slip: format similar to /send
++                # Use sender (bank) color for the slip if available
++                slip_color = get_embed_color_for_id(bank_id)
++                slip_embed = discord.Embed(
++                    title="Beta-tester Bonus — Transaction Slip",
++                    color=discord.Color(slip_color),
++                    description=(
++                        f"**{ctx.author.display_name}** received **$50** from the Bank as a Beta-tester bonus.\n\n"
++                        f"Amount: **$50**\n"
++                        f"Bank remaining balance: **${fmt_commas(from_bal)}**\n\n"
++                        f"Keep in mind your balance may change during the beta!"
++                    )
++                )
++                # set thumbnail to recipient pfp if available
++                if pfp:
++                    slip_embed.set_thumbnail(url=pfp)
++                await safe_respond(ctx, embed=slip_embed)
++            except Exception as e:
++                # If transfer unexpectedly failed despite bank_balance check, fall back to explanatory embed
++                print("Beta transfer error after bank balance check:", e)
++                bank_row = get_user_row(bank_id)
++                bank_balance = int(bank_row.get("balance", 0)) if bank_row else 0
++                bank_color = get_embed_color_for_id(bank_id)
++                bank_embed = discord.Embed(
++                    title="Beta-tester bonus Unavailable",
++                    color=discord.Color(bank_color),
++                    description=(
++                        f"The bank could not provide a beta-tester bonus at this time.\n"
++                        f"Bank balance: **${fmt_commas(bank_balance)}**\n"
++                        f"You can still start using your account normally."
++                    )
++                )
++                await safe_respond(ctx, embed=bank_embed)
++        else:
++            # bank doesn't have enough to give 50 (or bank not available). Show bank balance and note.
++            bank_color = get_embed_color_for_id(bank_id) if bank_id else EMBED_COLOR_YELLOW
++            bank_embed = discord.Embed(
++                title="Beta-tester bonus Unavailable",
++                color=discord.Color(bank_color),
++                description=(
++                    f"The bank could not provide a beta-tester bonus at this time.\n"
++                    f"Bank balance: **${fmt_commas(bank_balance)}**\n"
++                    f"You can still start using your account normally."
++                )
++            )
++            await safe_respond(ctx, embed=bank_embed)
+ 
+ 
+-
+-@bot.slash_command(name="balance", description="Check your balance or someone else's")
+-async def balance(ctx, user: discord.Option(discord.User, "The person whose balance to check", required=False, default=None)):
+-    used_followup = await safe_defer(ctx, ephemeral=False)
++@bot.slash_command(name="balance", description="Check someone's balance")
++async def balance(ctx, user: discord.Option(discord.User, "Person to check", required=False)):
++    await safe_defer(ctx)
+     target = user or ctx.author
+-    try:
+-        row = get_user_row(str(target.id))
+-        if not row:
+-            msg = f"{target.display_name} doesn't have an account! Use /register"
+-            if used_followup:
+-                await ctx.followup.send(msg, ephemeral=False)
+-            else:
+-                await safe_respond(ctx, msg, ephemeral=False)
+-            return
++    row = get_user_row(str(target.id))
++    if not row:
++        await safe_respond(ctx, f"{target.display_name} doesn't have an account! Use /register")
++        return
+ 
+-        balance_amount = row.get("balance", 0)
+-        pfp = row.get("pfp")
+-        embed = discord.Embed(
+-            title=target.display_name,
+-            color=discord.Color(EMBED_COLOR_YELLOW),
+-            description=f"**Balance:** ${fmt_commas(balance_amount)}"
+-        )
+-        if pfp:
+-            embed.set_thumbnail(url=pfp)
++    balance_amount = row.get("balance", 0)
++    pfp = row.get("pfp")
++    color_int = get_embed_color_for_id(str(target.id))
++
++    embed = discord.Embed(
++        title=target.display_name,
++        color=discord.Color(color_int),
++        description=f"**Balance:** ${fmt_commas(balance_amount)}"
++    )
++    if pfp:
++        embed.set_thumbnail(url=pfp)
+ 
+-        if used_followup:
+-            await ctx.followup.send(embed=embed)
+-        else:
+-            await safe_respond(ctx, embed=embed, ephemeral=False)
+-    except Exception as e:
+-        print("balance error:", e)
+-        await safe_respond(ctx, f"Error: {e}", ephemeral=False)
++    await safe_respond(ctx, embed=embed)
+ 
+ 
+ @bot.slash_command(name="send", description="Send money to another user")
+@@ -306,210 +381,104 @@
+     amount: discord.Option(int, "Amount to send"),
+     reason: discord.Option(str, "Reason to send money")
+ ):
+-    used_followup = await safe_defer(ctx, ephemeral=False)
+-    try:
+-        if amount <= 0:
+-            await safe_respond(ctx, "Please send a valid amount greater than 0", ephemeral=False)
+-            return
+-        if ctx.author.id == recipient.id:
+-            await safe_respond(ctx, "You cannot send yourself money", ephemeral=False)
+-            return
++    used_followup = await safe_defer(ctx)
++    if amount <= 0:
++        await safe_respond(ctx, "Amount must be greater than 0.")
++        return
++    if ctx.author.id == recipient.id:
++        await safe_respond(ctx, "You cannot send money to yourself.")
++        return
+ 
+-        sender_id = str(ctx.author.id)
+-        recipient_id = str(recipient.id)
++    sender_id = str(ctx.author.id)
++    recipient_id = str(recipient.id)
+ 
+-        sender_row = get_user_row(sender_id)
+-        recipient_row = get_user_row(recipient_id)
+-        if not sender_row or not recipient_row:
+-            await safe_respond(ctx, "You or the recipient don't have an account! Use /register", ephemeral=False)
+-            return
++    if not get_user_row(sender_id) or not get_user_row(recipient_id):
++        await safe_respond(ctx, "You or the recipient don't have an account! Use /register")
++        return
+ 
+-        try:
+-            from_bal, to_bal = await async_transfer(sender_id, recipient_id, amount, reason)
+-        except Exception as e:
+-            err = str(e)
+-            if "insufficient" in err.lower():
+-                await safe_respond(ctx, "You are trying to send more money than you have!", ephemeral=False)
+-            else:
+-                await safe_respond(ctx, f"Transaction failed: {err}", ephemeral=False)
+-            return
++    try:
++        from_bal, to_bal = await async_transfer(sender_id, recipient_id, amount, reason)
++    except Exception as e:
++        err = str(e)
++        if "insufficient" in err.lower():
++            await safe_respond(ctx, "You don't have enough funds!")
++        else:
++            await safe_respond(ctx, f"Transaction failed: {err}")
++        return
+ 
+-        embed = discord.Embed(
+-            title="Transaction Complete",
+-            color=discord.Color(EMBED_COLOR_YELLOW),
+-            description=(
+-                f"**{ctx.author.display_name} ({clean(from_bal)})** sent **${fmt_commas(amount)}** to "
+-                f"**{recipient.display_name} ({clean(to_bal)})**\n{reason}"
+-            )
+-        )
+-        thumb = recipient_row.get("pfp")
+-        if thumb:
+-            embed.set_thumbnail(url=thumb)
++    sender_row = get_user_row(sender_id)
++    recipient_row = get_user_row(recipient_id)
++    color_int = parse_color_hex_to_int(sender_row.get("color"))
++    embed = discord.Embed(
++        title="Transaction Complete",
++        color=discord.Color(color_int),
++        description=(
++            f"**{ctx.author.display_name} ({clean(from_bal)})** sent **${fmt_commas(amount)}** to "
++            f"**{recipient.display_name} ({clean(to_bal)})**\n{reason}"
++        )
++    )
++    thumb = recipient_row.get("pfp")
++    if thumb:
++        embed.set_thumbnail(url=thumb)
+ 
+-        if used_followup:
+-            await ctx.followup.send(embed=embed)
+-        else:
+-            await safe_respond(ctx, embed=embed, ephemeral=False)
+-
+-    except Exception as e:
+-        print("send error:", e)
+-        await safe_respond(ctx, "An error occurred while processing your transaction.", ephemeral=False)
+-
+-
+-# ---------------- Request view ----------------
+-class RequestSendButton(discord.ui.View):
+-    def __init__(self, requester: discord.User, recipient: discord.User, amount: int, reason: str, timeout: float = None):
+-        super().__init__(timeout=timeout)
+-        self.requester = requester  # person who will receive money
+-        self.recipient = recipient  # expected to pay (can accept/deny)
+-        self.amount = int(amount)
+-        self.reason = reason
+-
+-    async def _do_transfer(self, sender_id: str, recipient_id: str, amount: int, reason: str):
+-        return await async_transfer(sender_id, recipient_id, amount, reason)
++    await safe_respond(ctx, embed=embed)
+ 
+-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
+-    async def accept(self, button: discord.ui.Button, interaction: discord.Interaction):
+-        if interaction.user.id != self.recipient.id:
+-            await safe_respond(interaction, "You are not allowed to accept this request.", ephemeral=False)
+-            return
+ 
+-        # public followup
+-        try:
+-            await interaction.response.defer(ephemeral=False)
+-        except Exception:
+-            # ignore if already deferred/responded
+-            pass
+-
+-        sender_id = str(interaction.user.id)
+-        recipient_id = str(self.requester.id)
+-
+-        if not get_user_row(sender_id) or not get_user_row(recipient_id):
+-            await interaction.followup.send("Account missing — use /register", ephemeral=False)
+-            return
+-
+-        try:
+-            from_bal, to_bal = await self._do_transfer(sender_id, recipient_id, self.amount, self.reason)
+-        except Exception as e:
+-            err = str(e)
+-            if "insufficient" in err.lower():
+-                await interaction.followup.send("You don't have enough funds to accept this request.", ephemeral=False)
+-            else:
+-                await interaction.followup.send(f"Transaction failed: {err}", ephemeral=False)
+-            return
+-
+-        # best-effort delete original request and disable
+-        try:
+-            await interaction.message.delete()
+-        except Exception:
+-            pass
+-        self.disable_all_items()
+-        try:
+-            await interaction.message.edit(view=self)
+-        except Exception:
+-            pass
+-
+-        embed = discord.Embed(
+-            title="Transaction Complete",
+-            color=discord.Color(EMBED_COLOR_YELLOW),
+-            description=(
+-                f"**{interaction.user.display_name} ({clean(from_bal)})** sent **${fmt_commas(self.amount)}** to "
+-                f"**{self.requester.display_name} ({clean(to_bal)})**\n{self.reason}"
+-            )
+-        )
+-        embed.set_thumbnail(url=self.requester.display_avatar.url)
+-        await interaction.followup.send(embed=embed, ephemeral=False)
+-
+-    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
+-    async def deny(self, button: discord.ui.Button, interaction: discord.Interaction):
+-        if interaction.user.id != self.recipient.id:
+-            await safe_respond(interaction, "You are not allowed to deny this request.", ephemeral=False)
+-            return
+-
+-        try:
+-            await interaction.response.defer(ephemeral=False)
+-        except Exception:
+-            pass
+-
+-        try:
+-            await interaction.message.delete()
+-        except Exception:
+-            pass
+-
+-        self.disable_all_items()
+-        try:
+-            await interaction.message.edit(view=self)
+-        except Exception:
+-            pass
+-
+-        embed = discord.Embed(
+-            title="Request Denied",
+-            color=discord.Color(EMBED_COLOR_YELLOW),
+-            description=(
+-                f"**{interaction.user.display_name}** denied the request of **${fmt_commas(self.amount)}** "
+-                f"from **{self.requester.display_name}**\n{self.reason}"
+-            )
+-        )
+-        embed.set_thumbnail(url=self.requester.display_avatar.url)
+-        await interaction.followup.send(embed=embed, ephemeral=False)
+-
+-
+-# ---------------- request command ----------------
+-@bot.slash_command(name="request", description="Request someone to send you money")
+-async def request(
+-    ctx,
+-    target: discord.Option(discord.User, "Person who should send the money"),
+-    amount: discord.Option(int, "Amount requested"),
+-    reason: discord.Option(str, "Reason")
+-):
+-    used_followup = await safe_defer(ctx, ephemeral=False)
+-    if target.id == ctx.author.id:
+-        await safe_respond(ctx, "You cannot request money from yourself.", ephemeral=False)
+-        return
+-
+-    requester_row = get_user_row(str(ctx.author.id))
+-    requester_bal = requester_row.get("balance", 0) if requester_row else 0
+-    target_row = get_user_row(str(target.id))
+-    target_bal = target_row.get("balance", 0) if target_row else 0
+-
+-    embed = discord.Embed(
+-        title="Request to Send Money",
+-        color=discord.Color(EMBED_COLOR_YELLOW),
+-        description=(
+-            f"**{ctx.author.display_name} ({clean(requester_bal)})** is requesting **${fmt_commas(amount)}** "
+-            f"from **{target.display_name} ({clean(target_bal)})**\n{reason}"
+-        )
+-    )
+-    embed.set_thumbnail(url=ctx.author.display_avatar.url)
+-
+-    view = RequestSendButton(requester=ctx.author, recipient=target, amount=amount, reason=reason)
+-
+-    if used_followup:
+-        await ctx.followup.send(embed=embed, view=view)
+-    else:
+-        await safe_respond(ctx, embed=embed, view=view, ephemeral=False)
+-
+-@bot.slash_command(name="color", description="Set your favorite color (hex code, e.g., #FF00FF)")
++@bot.slash_command(name="color", description="Set your color (hex code, e.g., #FF00FF)")
+ async def color(ctx, hex_code: discord.Option(str, "Hex color code, like #FF00FF")):
+-    try:
+-        # Basic validation: starts with #, 7 characters, and valid hex digits
+-        if not (hex_code.startswith("#") and len(hex_code) == 7 and all(c in "0123456789ABCDEFabcdef" for c in hex_code[1:])):
+-            await safe_respond(ctx, "Invalid hex code. Example: `#FF00FF`", ephemeral=True)
+-            return
++    if not (hex_code.startswith("#") and len(hex_code) == 7 and all(c in "0123456789ABCDEFabcdef" for c in hex_code[1:])):
++        await safe_respond(ctx, "Invalid hex code. Example: `#FF00FF`", ephemeral=True)
++        return
+ 
+-        discord_id = str(ctx.author.id)
+-        # Make sure user exists
+-        if not get_user_row(discord_id):
+-            await safe_respond(ctx, "You don't have an account yet! Use /register first.", ephemeral=True)
+-            return
++    discord_id = str(ctx.author.id)
++    if not get_user_row(discord_id):
++        await safe_respond(ctx, "You don't have an account yet! Use /register first.", ephemeral=True)
++        return
+ 
+-        # Update the color in DB
+-        supabase.table("users").update({"color": hex_code}).eq("discord_id", discord_id).execute()
+-        await safe_respond(ctx, f"Your color has been updated to `{hex_code}`!", ephemeral=False)
+-    except Exception as e:
+-        print("color command error:", e)
+-        await safe_respond(ctx, f"Error setting color: {e}", ephemeral=True)
++    supabase.table("users").update({"color": hex_code}).eq("discord_id", discord_id).execute()
++    await safe_respond(ctx, f"Your color has been updated to `{hex_code}`!")
++
++
++@bot.slash_command(name="help", description="Show all available commands and info about the bot")
++async def help_command(ctx):
++    used_followup = await safe_defer(ctx, ephemeral=True)
++
++    # Use the bot's stored user color for help embed, falling back to constant
++    bot_id_str = str(bot.user.id) if bot.user else None
++    color_int = get_embed_color_for_id(bot_id_str) if bot_id_str else EMBED_COLOR_YELLOW
++
++    embed = discord.Embed(
++        title="FlipCoin",
++        color=discord.Color(color_int),
++        description=(
++            "Welcome to **FlipCoin**\n\n"
++            "FlipCoin is a legitimate centralized digital currency\n\n"
++            "It's purposefully untethered from the USD or computing power in order to create a freer market.\n\n"
++        )
++    )
++
++    commands_info = [
++        ("/register", "Create or update your account"),
++        ("/balance [user]", "Check your balance or someone else's."),
++        ("/send <recipient> <amount> <reason>", "Send money to another user."),
++        ("/request <user> <amount> <reason>", "Request money from another user."),
++        ("/color <hex>", "Set your  color for your account in Hex, e.g., #FF00FF."),
++        ("/help", "Show info about FlipCoin and all bot commands.")
++    ]
++
++    for cmd, desc in commands_info:
++        embed.add_field(name=cmd, value=desc, inline=False)
++
++    embed.set_footer(text="All transactions are final. Use /register before interacting.")
++
++    if used_followup:
++        await ctx.followup.send(embed=embed, ephemeral=True)
++    else:
++        await safe_respond(ctx, embed=embed, ephemeral=True)
++
++
++
+ 
+ # ---------------- run ----------------
+ if __name__ == "__main__":
+-    bot.run(TOKEN)
++    bot.run(TOKEN)
+\ No newline at end of file

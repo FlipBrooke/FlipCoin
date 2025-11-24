@@ -1,4 +1,4 @@
-# main.py — ready-to-run (welcome + conditional bank bonus + transaction slip)
+# main.py — merged + fixes (welcome bonus, request buttons, fixes)
 import asyncio
 import discord
 from dotenv import load_dotenv
@@ -9,6 +9,10 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# Optional: initial bank balance to bootstrap the "Bank" account if it doesn't exist.
+# Set as an integer string in .env, e.g. BANK_INITIAL_BALANCE=10000
+BANK_INITIAL_BALANCE = int(os.getenv("BANK_INITIAL_BALANCE", "10000"))
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 bot = discord.Bot(intents=discord.Intents.default())
@@ -82,6 +86,34 @@ def upsert_user_basic(discord_id: str, username: str, pfp_url: str, color_hex: s
     except Exception as e:
         print("upsert_user_basic error:", e)
         return False
+
+
+def ensure_bank_account_exists():
+    """
+    Ensure a bank account (bot user id) exists in the users table. If missing, optionally create it
+    with BANK_INITIAL_BALANCE (from env). Returns bank_id (str) or None if bot.user not available.
+    """
+    if not bot.user:
+        return None
+    bank_id = str(bot.user.id)
+    try:
+        row = get_user_row(bank_id)
+        if row:
+            return bank_id
+        # create the bank user with default name 'Bank' and a neutral color; pfp uses bot avatar if available
+        pfp_url = str(bot.user.display_avatar.url) if bot.user else None
+        color_hex = f"#{EMBED_COLOR_YELLOW:06x}"
+        supabase.table("users").insert({
+            "discord_id": bank_id,
+            "username": "Bank",
+            "pfp": pfp_url,
+            "color": color_hex,
+            "balance": BANK_INITIAL_BALANCE
+        }).execute()
+        return bank_id
+    except Exception as e:
+        print("ensure_bank_account_exists error:", e)
+        return bank_id
 
 
 def log_transaction(from_id: str, to_id: str, amount: int, from_bal: int, to_bal: int, reason: str):
@@ -162,6 +194,7 @@ def transfer_money(sender_id: str, recipient_id: str, amount: int, reason: str):
         try:
             return fallback_transfer(sender_id, recipient_id, amount, reason)
         except Exception:
+            # re-raise original RPC exception if fallback also fails
             raise
 
 
@@ -210,11 +243,16 @@ async def safe_defer(ctx, ephemeral: bool = False) -> bool:
             await ctx.defer(ephemeral=ephemeral)
             return True
     except Exception as e:
+        # common when interaction already responded/expired
         print("safe_defer:", e)
     return False
 
 
 async def safe_respond(ctx, *args, ephemeral=False, **kwargs):
+    """
+    Send a reply safely: if already deferred/responded, use followup; else respond.
+    If both fail, attempt a minimal ephemeral to the user to avoid silent failures.
+    """
     try:
         if hasattr(ctx, "response"):
             if ctx.response.is_done():
@@ -222,12 +260,22 @@ async def safe_respond(ctx, *args, ephemeral=False, **kwargs):
             else:
                 await ctx.respond(*args, ephemeral=ephemeral, **kwargs)
         else:
+            # fallback for raw Interaction-like objects
             await ctx.send(*args, **kwargs)
-    except Exception:
+    except Exception as e:
+        print("safe_respond intermediate failure:", e)
         try:
-            await ctx.followup.send(*args, ephemeral=ephemeral, **kwargs)
-        except Exception as e:
-            print("safe_respond final failure:", e)
+            # best-effort final fallback: send ephemeral directly to the user (if available)
+            if hasattr(ctx, "author") and getattr(ctx, "author", None):
+                try:
+                    await ctx.author.send("The bot attempted to respond but failed to send the full message. Check the server or try again.")
+                except Exception:
+                    # last resort: do nothing, but log it
+                    print("safe_respond final fallback DM failed")
+            else:
+                print("safe_respond has no author to DM.")
+        except Exception as e2:
+            print("safe_respond final failure:", e2)
 
 
 # ---------------- events ----------------
@@ -239,6 +287,104 @@ async def on_ready():
     except Exception as e:
         print("sync_commands error:", e)
     print("BUY BUY BUY! SELL SELL SELL!")
+
+
+# ---------------- Request view ----------------
+class RequestSendButton(discord.ui.View):
+    def __init__(self, requester: discord.User, recipient: discord.User, amount: int, reason: str, timeout: float = None):
+        super().__init__(timeout=timeout)
+        self.requester = requester  # person who will receive money
+        self.recipient = recipient  # expected to pay (can accept/deny)
+        self.amount = int(amount)
+        self.reason = reason
+
+    async def _do_transfer(self, sender_id: str, recipient_id: str, amount: int, reason: str):
+        return await async_transfer(sender_id, recipient_id, amount, reason)
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
+    async def accept(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user.id != self.recipient.id:
+            await safe_respond(interaction, "You are not allowed to accept this request.", ephemeral=True)
+            return
+
+        # public followup
+        try:
+            await interaction.response.defer(ephemeral=False)
+        except Exception:
+            # ignore if already deferred/responded
+            pass
+
+        sender_id = str(interaction.user.id)
+        recipient_id = str(self.requester.id)
+
+        if not get_user_row(sender_id) or not get_user_row(recipient_id):
+            await interaction.followup.send("Account missing — use /register", ephemeral=True)
+            return
+
+        try:
+            from_bal, to_bal = await self._do_transfer(sender_id, recipient_id, self.amount, self.reason)
+        except Exception as e:
+            err = str(e)
+            if "insufficient" in err.lower():
+                await interaction.followup.send("You don't have enough funds to accept this request.", ephemeral=False)
+            else:
+                await interaction.followup.send(f"Transaction failed: {err}", ephemeral=False)
+            return
+
+        # best-effort delete original request and disable buttons
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+        self.disable_all_items()
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+        embed = discord.Embed(
+            title="Transaction Complete",
+            color=discord.Color(get_embed_color_for_id(sender_id)),
+            description=(
+                f"**{interaction.user.display_name} ({clean(from_bal)})** sent **${fmt_commas(self.amount)}** to "
+                f"**{self.requester.display_name} ({clean(to_bal)})**\n{self.reason}"
+            )
+        )
+        embed.set_thumbnail(url=self.requester.display_avatar.url)
+        await interaction.followup.send(embed=embed, ephemeral=False)
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
+    async def deny(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user.id != self.recipient.id:
+            await safe_respond(interaction, "You are not allowed to deny this request.", ephemeral=True)
+            return
+
+        try:
+            await interaction.response.defer(ephemeral=False)
+        except Exception:
+            pass
+
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+
+        self.disable_all_items()
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+        embed = discord.Embed(
+            title="Request Denied",
+            color=discord.Color(get_embed_color_for_id(str(interaction.user.id))),
+            description=(
+                f"**{interaction.user.display_name}** denied the request of **${fmt_commas(self.amount)}** "
+                f"from **{self.requester.display_name}**\n{self.reason}"
+            )
+        )
+        embed.set_thumbnail(url=self.requester.display_avatar.url)
+        await interaction.followup.send(embed=embed, ephemeral=False)
 
 
 # ---------------- commands ----------------
@@ -284,11 +430,9 @@ async def register(ctx):
 
     # If this was a NEW registration, try to give up to 50 coins from the bank
     if was_new:
-        bank_id = None
-        if bot.user:
-            bank_id = str(bot.user.id)
+        bank_id = ensure_bank_account_exists()
 
-        # if no bank account exists in DB, treat as balance 0
+        # if no bank account exists or bot user not available, treat as balance 0
         bank_balance = 0
         if bank_id:
             bank_row = get_user_row(bank_id)
@@ -297,30 +441,31 @@ async def register(ctx):
         # If the bank has at least 50, attempt transfer
         if bank_balance >= 50 and bank_id:
             try:
-                from_bal, to_bal = await async_transfer(bank_id, discord_id, 50, "${username}'s beta-tester bonus")
+                # Fixed: format the reason to include username
+                reason_text = f"{username}'s beta-tester bonus"
+                from_bal, to_bal = await async_transfer(bank_id, discord_id, 50, reason_text)
+
                 # refresh user row for accurate display
                 row = get_user_row(discord_id)
                 balance_amount = row.get("balance", balance_amount) if row else balance_amount
 
                 # Transaction slip: format similar to /send
-                # Use sender (bank) color for the slip if available
                 slip_color = get_embed_color_for_id(bank_id)
                 slip_embed = discord.Embed(
                     title="Beta-tester Bonus — Transaction Slip",
                     color=discord.Color(slip_color),
                     description=(
-                        f"**{ctx.author.display_name}** received **$50** from the Bank as a Beta-tester bonus.\n\n"
+                        f"**{username}** received **$50** from the Bank as a beta-tester bonus.\n\n"
                         f"Amount: **$50**\n"
                         f"Bank remaining balance: **${fmt_commas(from_bal)}**\n\n"
                         f"Keep in mind your balance may change during the beta!"
                     )
                 )
-                # set thumbnail to recipient pfp if available
                 if pfp:
                     slip_embed.set_thumbnail(url=pfp)
                 await safe_respond(ctx, embed=slip_embed)
             except Exception as e:
-                # If transfer unexpectedly failed despite bank_balance check, fall back to explanatory embed
+                # If transfer unexpectedly failed despite bank_balance check, show helpful embed and log
                 print("Beta transfer error after bank balance check:", e)
                 bank_row = get_user_row(bank_id)
                 bank_balance = int(bank_row.get("balance", 0)) if bank_row else 0
@@ -352,7 +497,7 @@ async def register(ctx):
 
 @bot.slash_command(name="balance", description="Check someone's balance")
 async def balance(ctx, user: discord.Option(discord.User, "Person to check", required=False)):
-    await safe_defer(ctx)
+    used_followup = await safe_defer(ctx)
     target = user or ctx.author
     row = get_user_row(str(target.id))
     if not row:
@@ -371,7 +516,10 @@ async def balance(ctx, user: discord.Option(discord.User, "Person to check", req
     if pfp:
         embed.set_thumbnail(url=pfp)
 
-    await safe_respond(ctx, embed=embed)
+    if used_followup:
+        await ctx.followup.send(embed=embed)
+    else:
+        await safe_respond(ctx, embed=embed)
 
 
 @bot.slash_command(name="send", description="Send money to another user")
@@ -421,7 +569,45 @@ async def send(
     if thumb:
         embed.set_thumbnail(url=thumb)
 
-    await safe_respond(ctx, embed=embed)
+    if used_followup:
+        await ctx.followup.send(embed=embed)
+    else:
+        await safe_respond(ctx, embed=embed)
+
+
+@bot.slash_command(name="request", description="Request someone to send you money")
+async def request(
+    ctx,
+    target: discord.Option(discord.User, "Person who should send the money"),
+    amount: discord.Option(int, "Amount requested"),
+    reason: discord.Option(str, "Reason")
+):
+    used_followup = await safe_defer(ctx)
+    if target.id == ctx.author.id:
+        await safe_respond(ctx, "You cannot request money from yourself.")
+        return
+
+    requester_row = get_user_row(str(ctx.author.id))
+    requester_bal = requester_row.get("balance", 0) if requester_row else 0
+    target_row = get_user_row(str(target.id))
+    target_bal = target_row.get("balance", 0) if target_row else 0
+
+    embed = discord.Embed(
+        title="Request to Send Money",
+        color=discord.Color(get_embed_color_for_id(str(ctx.author.id))),
+        description=(
+            f"**{ctx.author.display_name} ({clean(requester_bal)})** is requesting **${fmt_commas(amount)}** "
+            f"from **{target.display_name} ({clean(target_bal)})**\n{reason}"
+        )
+    )
+    embed.set_thumbnail(url=ctx.author.display_avatar.url)
+
+    view = RequestSendButton(requester=ctx.author, recipient=target, amount=amount, reason=reason)
+
+    if used_followup:
+        await ctx.followup.send(embed=embed, view=view)
+    else:
+        await safe_respond(ctx, embed=embed, view=view)
 
 
 @bot.slash_command(name="color", description="Set your color (hex code, e.g., #FF00FF)")
@@ -462,7 +648,7 @@ async def help_command(ctx):
         ("/balance [user]", "Check your balance or someone else's."),
         ("/send <recipient> <amount> <reason>", "Send money to another user."),
         ("/request <user> <amount> <reason>", "Request money from another user."),
-        ("/color <hex>", "Set your  color for your account in Hex, e.g., #FF00FF."),
+        ("/color <hex>", "Set your color for your account in Hex, e.g., #FF00FF."),
         ("/help", "Show info about FlipCoin and all bot commands.")
     ]
 
