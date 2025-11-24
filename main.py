@@ -1,6 +1,6 @@
 # main.py — ready-to-run (welcome + conditional bank bonus + transaction slip)
 import asyncio
-import py-cord
+import discord
 from dotenv import load_dotenv
 from supabase import create_client, Client
 import os
@@ -424,7 +424,7 @@ async def send(
     await safe_respond(ctx, embed=embed)
 
 
-@bot.slash_command(name="color", description="Set your favorite color (hex code, e.g., #FF00FF)")
+@bot.slash_command(name="color", description="Set your color (hex code, e.g., #FF00FF)")
 async def color(ctx, hex_code: discord.Option(str, "Hex color code, like #FF00FF")):
     if not (hex_code.startswith("#") and len(hex_code) == 7 and all(c in "0123456789ABCDEFabcdef" for c in hex_code[1:])):
         await safe_respond(ctx, "Invalid hex code. Example: `#FF00FF`", ephemeral=True)
