@@ -2,3 +2,4 @@ discord.py
 python-dotenv
 supabase
 httpx
+py-cord

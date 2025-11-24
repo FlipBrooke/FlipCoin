@@ -1,6 +1,6 @@
 # main.py — ready-to-run (welcome + conditional bank bonus + transaction slip)
 import asyncio
-import discord
+import py-cord
 from dotenv import load_dotenv
 from supabase import create_client, Client
 import os
@@ -311,7 +311,6 @@ async def register(ctx):
                     description=(
                         f"**{ctx.author.display_name}** received **$50** from the Bank as a Beta-tester bonus.\n\n"
                         f"Amount: **$50**\n"
-                        f"Your new balance: **${fmt_commas(balance_amount)}**\n"
                         f"Bank remaining balance: **${fmt_commas(from_bal)}**\n\n"
                         f"Keep in mind your balance may change during the beta!"
                     )
